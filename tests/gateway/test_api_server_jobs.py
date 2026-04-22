@@ -663,3 +663,19 @@ class TestCronUnavailable:
             with patch(f"{_MOD}._CRON_AVAILABLE", False):
                 resp = await cli.post(f"/api/jobs/{VALID_JOB_ID}/run")
                 assert resp.status == 501
+
+
+class TestSchedulerProviderValidation:
+    @pytest.mark.asyncio
+    async def test_invalid_scheduler_provider_returns_500(self, adapter):
+        """GET /api/jobs returns a clear 500 when scheduler provider config is invalid."""
+        app = _create_app(adapter)
+        async with TestClient(TestServer(app)) as cli:
+            with patch(f"{_MOD}._CRON_AVAILABLE", True), patch(
+                f"{_MOD}._cron_validate_provider",
+                side_effect=RuntimeError("Unsupported cron scheduler provider 'banana'. Supported providers: builtin."),
+            ):
+                resp = await cli.get("/api/jobs")
+                assert resp.status == 500
+                data = await resp.json()
+                assert "Unsupported cron scheduler provider 'banana'" in data["error"]

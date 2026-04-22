@@ -8,6 +8,7 @@ from unittest.mock import AsyncMock, patch, MagicMock
 import pytest
 
 from cron.scheduler import _resolve_origin, _resolve_delivery_target, _deliver_result, _send_media_via_adapter, run_job, SILENT_MARKER, _build_job_prompt
+from cron.provider import SchedulerProviderError
 from tools.env_passthrough import clear_env_passthrough
 from tools.credential_files import clear_credential_files
 
@@ -1144,6 +1145,24 @@ class TestSilentDelivery:
             tick(verbose=False)
         save_mock.assert_called_once_with("monitor-job", "# full output")
         deliver_mock.assert_not_called()
+
+
+class TestSchedulerProviderValidation:
+    def test_tick_logs_and_raises_for_unsupported_provider(self, caplog):
+        from cron.scheduler import tick
+
+        with patch(
+            "cron.scheduler.ensure_supported_scheduler_provider",
+            side_effect=SchedulerProviderError("Unsupported cron scheduler provider 'banana'. Supported providers: builtin."),
+        ):
+            with caplog.at_level(logging.ERROR, logger="cron.scheduler"):
+                with pytest.raises(SchedulerProviderError, match="Unsupported cron scheduler provider 'banana'"):
+                    tick(verbose=False)
+
+        assert any(
+            "Cron scheduler provider configuration error" in record.message
+            for record in caplog.records
+        )
 
 
 class TestBuildJobPromptSilentHint:

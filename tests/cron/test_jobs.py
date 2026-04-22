@@ -24,6 +24,7 @@ from cron.jobs import (
     get_due_jobs,
     save_job_output,
 )
+from cron.provider import SchedulerProviderError
 
 
 # =========================================================================
@@ -189,6 +190,29 @@ def tmp_cron_dir(tmp_path, monkeypatch):
 
 
 class TestJobCRUD:
+    def test_create_job_defaults_to_builtin_provider(self, tmp_cron_dir, monkeypatch):
+        monkeypatch.setattr("cron.provider.load_config", lambda: {})
+        job = create_job(prompt="Check server status", schedule="30m")
+        assert job["id"]
+        assert job["prompt"] == "Check server status"
+
+    def test_create_job_accepts_explicit_builtin_provider(self, tmp_cron_dir, monkeypatch):
+        monkeypatch.setattr(
+            "cron.provider.load_config",
+            lambda: {"cron": {"scheduler": {"provider": "builtin"}}},
+        )
+        job = create_job(prompt="Check server status", schedule="30m")
+        assert job["id"]
+        assert job["prompt"] == "Check server status"
+
+    def test_create_job_rejects_unsupported_provider(self, tmp_cron_dir, monkeypatch):
+        monkeypatch.setattr(
+            "cron.provider.load_config",
+            lambda: {"cron": {"scheduler": {"provider": "banana"}}},
+        )
+        with pytest.raises(SchedulerProviderError, match="Unsupported cron scheduler provider 'banana'"):
+            create_job(prompt="Check server status", schedule="30m")
+
     def test_create_and_get(self, tmp_cron_dir):
         job = create_job(prompt="Check server status", schedule="30m")
         assert job["id"]
@@ -455,6 +479,14 @@ class TestAdvanceNextRun:
 
 
 class TestGetDueJobs:
+    def test_list_jobs_rejects_non_mapping_scheduler_config(self, tmp_cron_dir, monkeypatch):
+        monkeypatch.setattr(
+            "cron.provider.load_config",
+            lambda: {"cron": {"scheduler": "builtin"}},
+        )
+        with pytest.raises(SchedulerProviderError, match="'cron.scheduler' must be a mapping"):
+            list_jobs()
+
     def test_past_due_within_window_returned(self, tmp_cron_dir):
         """Jobs within the dynamic grace window are still considered due (not stale).
 

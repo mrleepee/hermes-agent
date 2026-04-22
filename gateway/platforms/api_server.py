@@ -546,6 +546,7 @@ try:
         resume_job as _cron_resume,
         trigger_job as _cron_trigger,
     )
+    from cron.provider import ensure_supported_scheduler_provider as _cron_validate_provider
     _CRON_AVAILABLE = True
 except ImportError:
     _cron_list = None
@@ -556,6 +557,7 @@ except ImportError:
     _cron_pause = None
     _cron_resume = None
     _cron_trigger = None
+    _cron_validate_provider = None
 
 
 class APIServerAdapter(BasePlatformAdapter):
@@ -1900,6 +1902,11 @@ class APIServerAdapter(BasePlatformAdapter):
             return web.json_response(
                 {"error": "Cron module not available"}, status=501,
             )
+        try:
+            if _cron_validate_provider is not None:
+                _cron_validate_provider()
+        except Exception as e:
+            return web.json_response({"error": str(e)}, status=500)
         return None
 
     def _check_job_id(self, request: "web.Request") -> tuple:

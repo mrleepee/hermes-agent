@@ -853,6 +853,11 @@ DEFAULT_CONFIG = {
     },
 
     "cron": {
+        "scheduler": {
+            # Scheduler provider selection. Phase 1 supports only the
+            # built-in provider; future phases can add remote providers.
+            "provider": "builtin",
+        },
         # Wrap delivered cron responses with a header (task name) and footer
         # ("The agent cannot see this message").  Set to false for clean output.
         "wrap_response": True,

@@ -37,6 +37,7 @@ sys.path.insert(0, str(Path(__file__).parent.parent))
 from hermes_constants import get_hermes_home
 from hermes_cli.config import load_config
 from hermes_time import now as _hermes_now
+from cron.provider import ensure_supported_scheduler_provider, SchedulerProviderError
 
 logger = logging.getLogger(__name__)
 
@@ -1049,6 +1050,12 @@ def tick(verbose: bool = True, adapters=None, loop=None) -> int:
     Returns:
         Number of jobs executed (0 if another tick is already running)
     """
+    try:
+        ensure_supported_scheduler_provider()
+    except SchedulerProviderError as exc:
+        logger.error("Cron scheduler provider configuration error: %s", exc)
+        raise
+
     _LOCK_DIR.mkdir(parents=True, exist_ok=True)
 
     # Cross-platform file locking: fcntl on Unix, msvcrt on Windows

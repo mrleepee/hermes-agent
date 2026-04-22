@@ -17,6 +17,7 @@ from datetime import datetime, timedelta
 from pathlib import Path
 from hermes_constants import get_hermes_home
 from typing import Optional, Dict, List, Any
+from cron.provider import ensure_supported_scheduler_provider
 
 logger = logging.getLogger(__name__)
 
@@ -325,6 +326,7 @@ def compute_next_run(schedule: Dict[str, Any], last_run_at: Optional[str] = None
 
 def load_jobs() -> List[Dict[str, Any]]:
     """Load all jobs from storage."""
+    ensure_supported_scheduler_provider()
     ensure_dirs()
     if not JOBS_FILE.exists():
         return []
@@ -354,6 +356,7 @@ def load_jobs() -> List[Dict[str, Any]]:
 
 def save_jobs(jobs: List[Dict[str, Any]]):
     """Save all jobs to storage."""
+    ensure_supported_scheduler_provider()
     ensure_dirs()
     fd, tmp_path = tempfile.mkstemp(dir=str(JOBS_FILE.parent), suffix='.tmp', prefix='.jobs_')
     try:
