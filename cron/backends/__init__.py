@@ -1,7 +1,9 @@
 from .base import (
     SchedulerBackend,
     SchedulerBackendConfig,
+    SchedulerMachineConfig,
     SchedulerProviderError,
+    SchedulerRemoteError,
     SchedulerRemoteConfig,
 )
 from .builtin import BuiltinSchedulerBackend
@@ -12,6 +14,8 @@ __all__ = [
     "FlyMachineSchedulerBackend",
     "SchedulerBackend",
     "SchedulerBackendConfig",
+    "SchedulerMachineConfig",
     "SchedulerProviderError",
+    "SchedulerRemoteError",
     "SchedulerRemoteConfig",
 ]

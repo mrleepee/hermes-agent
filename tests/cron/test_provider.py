@@ -34,6 +34,11 @@ class TestSchedulerBackendConfig:
         monkeypatch.delenv("HERMES_REMOTE_SCHEDULER_BASE_URL", raising=False)
         monkeypatch.delenv("HERMES_REMOTE_SCHEDULER_API_TOKEN", raising=False)
         monkeypatch.delenv("HERMES_SCHEDULER_DISPATCH_BEARER_TOKEN", raising=False)
+        monkeypatch.delenv("FLY_MACHINE_ID", raising=False)
+        monkeypatch.delenv("FLY_APP_NAME", raising=False)
+        monkeypatch.delenv("FLY_REGION", raising=False)
+        monkeypatch.delenv("FLY_MACHINE_NAME", raising=False)
+        monkeypatch.delenv("HOSTNAME", raising=False)
         backend_config = get_scheduler_backend_config(
             {
                 "cron": {
@@ -43,6 +48,12 @@ class TestSchedulerBackendConfig:
                             "base_url": "https://scheduler.internal",
                             "api_token": "api-token",
                             "dispatch_token": "dispatch-token",
+                            "machine": {
+                                "machine_id": "machine-123",
+                                "app_name": "liberland-hermes",
+                                "region": "sin",
+                                "machine_name": "autumn-river-3",
+                            },
                         },
                     }
                 }
@@ -52,11 +63,19 @@ class TestSchedulerBackendConfig:
         assert backend_config.remote.base_url == "https://scheduler.internal"
         assert backend_config.remote.api_token == "api-token"
         assert backend_config.remote.dispatch_token == "dispatch-token"
+        assert backend_config.remote.machine.machine_id == "machine-123"
+        assert backend_config.remote.machine.app_name == "liberland-hermes"
+        assert backend_config.remote.machine.region == "sin"
+        assert backend_config.remote.machine.machine_name == "autumn-river-3"
 
     def test_remote_backend_env_overrides_take_precedence(self, monkeypatch):
         monkeypatch.setenv("HERMES_REMOTE_SCHEDULER_BASE_URL", "https://env.scheduler")
         monkeypatch.setenv("HERMES_REMOTE_SCHEDULER_API_TOKEN", "env-api-token")
         monkeypatch.setenv("HERMES_SCHEDULER_DISPATCH_BEARER_TOKEN", "env-dispatch-token")
+        monkeypatch.setenv("FLY_MACHINE_ID", "env-machine-id")
+        monkeypatch.setenv("FLY_APP_NAME", "env-app")
+        monkeypatch.setenv("FLY_REGION", "sin")
+        monkeypatch.setenv("FLY_MACHINE_NAME", "env-machine-name")
         backend_config = get_scheduler_backend_config(
             {
                 "cron": {
@@ -66,6 +85,12 @@ class TestSchedulerBackendConfig:
                             "base_url": "https://config.scheduler",
                             "api_token": "config-api-token",
                             "dispatch_token": "config-dispatch-token",
+                            "machine": {
+                                "machine_id": "config-machine-id",
+                                "app_name": "config-app",
+                                "region": "iad",
+                                "machine_name": "config-machine-name",
+                            },
                         },
                     }
                 }
@@ -74,6 +99,10 @@ class TestSchedulerBackendConfig:
         assert backend_config.remote.base_url == "https://env.scheduler"
         assert backend_config.remote.api_token == "env-api-token"
         assert backend_config.remote.dispatch_token == "env-dispatch-token"
+        assert backend_config.remote.machine.machine_id == "env-machine-id"
+        assert backend_config.remote.machine.app_name == "env-app"
+        assert backend_config.remote.machine.region == "sin"
+        assert backend_config.remote.machine.machine_name == "env-machine-name"
 
 
 class TestSchedulerBackendFactory:
@@ -89,25 +118,9 @@ class TestSchedulerBackendFactory:
         else:
             raise AssertionError("Expected SchedulerProviderError")
 
-    def test_build_remote_backend(self):
-        backend = build_scheduler_backend(
-            {
-                "cron": {
-                    "scheduler": {
-                        "provider": "fly_machine_scheduler",
-                        "remote": {
-                            "base_url": "https://scheduler.internal",
-                            "api_token": "api-token",
-                        },
-                    }
-                }
-            }
-        )
-        assert isinstance(backend, FlyMachineSchedulerBackend)
-
-    def test_remote_backend_runtime_not_ready_yet(self):
+    def test_build_remote_backend_requires_machine_identity(self):
         try:
-            ensure_scheduler_backend_runtime(
+            build_scheduler_backend(
                 {
                     "cron": {
                         "scheduler": {
@@ -121,6 +134,48 @@ class TestSchedulerBackendFactory:
                 }
             )
         except SchedulerProviderError as exc:
-            assert "not implemented in this phase yet" in str(exc)
+            assert "requires machine identity" in str(exc)
         else:
             raise AssertionError("Expected SchedulerProviderError")
+
+    def test_build_remote_backend(self):
+        backend = build_scheduler_backend(
+            {
+                "cron": {
+                    "scheduler": {
+                        "provider": "fly_machine_scheduler",
+                        "remote": {
+                            "base_url": "https://scheduler.internal",
+                            "api_token": "api-token",
+                            "machine": {
+                                "machine_id": "machine-123",
+                                "app_name": "liberland-hermes",
+                                "region": "sin",
+                            },
+                        },
+                    }
+                }
+            }
+        )
+        assert isinstance(backend, FlyMachineSchedulerBackend)
+
+    def test_remote_backend_runtime_ready_with_valid_config(self):
+        backend = ensure_scheduler_backend_runtime(
+            {
+                "cron": {
+                    "scheduler": {
+                        "provider": "fly_machine_scheduler",
+                        "remote": {
+                            "base_url": "https://scheduler.internal",
+                            "api_token": "api-token",
+                            "machine": {
+                                "machine_id": "machine-123",
+                                "app_name": "liberland-hermes",
+                                "region": "sin",
+                            },
+                        },
+                    }
+                }
+            }
+        )
+        assert isinstance(backend, FlyMachineSchedulerBackend)

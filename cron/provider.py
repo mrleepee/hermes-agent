@@ -9,6 +9,7 @@ from cron.backends import (
     FlyMachineSchedulerBackend,
     SchedulerBackend,
     SchedulerBackendConfig,
+    SchedulerMachineConfig,
     SchedulerProviderError,
     SchedulerRemoteConfig,
 )
@@ -44,6 +45,25 @@ def _get_env_override(name: str) -> str | None:
     return value or None
 
 
+def _load_machine_config(remote_cfg: Mapping[str, Any]) -> SchedulerMachineConfig:
+    machine_cfg = _require_mapping(remote_cfg.get("machine", {}), "cron.scheduler.remote.machine")
+    return SchedulerMachineConfig(
+        machine_id=_get_env_override("FLY_MACHINE_ID")
+        or str(machine_cfg.get("machine_id") or "").strip()
+        or None,
+        app_name=_get_env_override("FLY_APP_NAME")
+        or str(machine_cfg.get("app_name") or "").strip()
+        or None,
+        region=_get_env_override("FLY_REGION")
+        or str(machine_cfg.get("region") or "").strip()
+        or None,
+        machine_name=_get_env_override("FLY_MACHINE_NAME")
+        or _get_env_override("HOSTNAME")
+        or str(machine_cfg.get("machine_name") or "").strip()
+        or None,
+    )
+
+
 def get_scheduler_provider(config: Mapping[str, Any] | None = None) -> str:
     """Return the configured scheduler provider, defaulting to ``builtin``."""
     scheduler_cfg = _get_scheduler_config_mapping(config)
@@ -60,9 +80,13 @@ def get_scheduler_provider(config: Mapping[str, Any] | None = None) -> str:
     return normalized or DEFAULT_SCHEDULER_PROVIDER
 
 
-def get_scheduler_backend_config(config: Mapping[str, Any] | None = None) -> SchedulerBackendConfig:
+def get_scheduler_backend_config(
+    config: Mapping[str, Any] | None = None,
+    *,
+    provider_override: str | None = None,
+) -> SchedulerBackendConfig:
     scheduler_cfg = _get_scheduler_config_mapping(config)
-    provider = get_scheduler_provider(config)
+    provider = provider_override or get_scheduler_provider(config)
     remote_cfg = _require_mapping(scheduler_cfg.get("remote", {}), "cron.scheduler.remote")
 
     return SchedulerBackendConfig(
@@ -77,6 +101,7 @@ def get_scheduler_backend_config(config: Mapping[str, Any] | None = None) -> Sch
             dispatch_token=_get_env_override("HERMES_SCHEDULER_DISPATCH_BEARER_TOKEN")
             or str(remote_cfg.get("dispatch_token") or "").strip()
             or None,
+            machine=_load_machine_config(remote_cfg),
         ),
     )
 
@@ -94,7 +119,20 @@ def ensure_supported_scheduler_provider(config: Mapping[str, Any] | None = None)
 
 def build_scheduler_backend(config: Mapping[str, Any] | None = None) -> SchedulerBackend:
     provider = ensure_supported_scheduler_provider(config)
-    backend_config = get_scheduler_backend_config(config)
+    return build_scheduler_backend_for_provider(provider, config)
+
+
+def build_scheduler_backend_for_provider(
+    provider: str,
+    config: Mapping[str, Any] | None = None,
+) -> SchedulerBackend:
+    provider = str(provider).strip().lower()
+    if provider not in SUPPORTED_SCHEDULER_PROVIDERS:
+        supported = ", ".join(sorted(SUPPORTED_SCHEDULER_PROVIDERS))
+        raise SchedulerProviderError(
+            f"Unsupported cron scheduler provider '{provider}'. Supported providers: {supported}."
+        )
+    backend_config = get_scheduler_backend_config(config, provider_override=provider)
     if provider == DEFAULT_SCHEDULER_PROVIDER:
         backend: SchedulerBackend = BuiltinSchedulerBackend(backend_config)
     elif provider == REMOTE_SCHEDULER_PROVIDER:

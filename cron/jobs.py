@@ -17,7 +17,12 @@ from datetime import datetime, timedelta
 from pathlib import Path
 from hermes_constants import get_hermes_home
 from typing import Optional, Dict, List, Any
-from cron.provider import ensure_scheduler_backend_runtime
+from cron.provider import (
+    DEFAULT_SCHEDULER_PROVIDER,
+    build_scheduler_backend,
+    build_scheduler_backend_for_provider,
+    ensure_scheduler_backend_runtime,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -69,6 +74,63 @@ def _apply_skill_fields(job: Dict[str, Any]) -> Dict[str, Any]:
     normalized["skills"] = skills
     normalized["skill"] = skills[0] if skills else None
     return normalized
+
+
+def _job_scheduler_provider(job: Dict[str, Any]) -> str:
+    provider = str(job.get("scheduler_provider") or DEFAULT_SCHEDULER_PROVIDER).strip().lower()
+    return provider or DEFAULT_SCHEDULER_PROVIDER
+
+
+def _apply_scheduler_fields(job: Dict[str, Any]) -> Dict[str, Any]:
+    normalized = _apply_skill_fields(job)
+    provider = _job_scheduler_provider(normalized)
+    normalized["scheduler_provider"] = provider
+    remote = normalized.get("scheduler_remote")
+
+    if provider == DEFAULT_SCHEDULER_PROVIDER:
+        normalized["scheduler_remote"] = remote if isinstance(remote, dict) else None
+        return normalized
+
+    remote = remote if isinstance(remote, dict) else {}
+    normalized["scheduler_remote"] = {
+        "job_id": str(remote.get("job_id") or normalized["id"]),
+        "last_synced_at": remote.get("last_synced_at"),
+        "last_sync_error": remote.get("last_sync_error"),
+    }
+    return normalized
+
+
+def _set_scheduler_sync_metadata(job: Dict[str, Any], sync_result: Dict[str, Any] | None) -> Dict[str, Any]:
+    normalized = _apply_scheduler_fields(job)
+    provider = _job_scheduler_provider(normalized)
+    normalized["scheduler_provider"] = provider
+    if provider == DEFAULT_SCHEDULER_PROVIDER:
+        normalized["scheduler_remote"] = None
+        return normalized
+
+    sync_result = sync_result or {}
+    existing = normalized.get("scheduler_remote") if isinstance(normalized.get("scheduler_remote"), dict) else {}
+    normalized["scheduler_remote"] = {
+        "job_id": str(sync_result.get("job_id") or existing.get("job_id") or normalized["id"]),
+        "last_synced_at": sync_result.get("last_synced_at"),
+        "last_sync_error": sync_result.get("last_sync_error"),
+    }
+    return normalized
+
+
+def _current_scheduler_backend():
+    return build_scheduler_backend()
+
+
+def _job_scheduler_backend(job: Dict[str, Any]):
+    return build_scheduler_backend_for_provider(_job_scheduler_provider(job))
+
+
+def _rollback_remote_sync(label: str, rollback) -> None:
+    try:
+        rollback()
+    except Exception as exc:
+        logger.warning("Failed remote scheduler rollback for %s: %s", label, exc)
 
 
 def _secure_dir(path: Path):
@@ -334,13 +396,13 @@ def load_jobs() -> List[Dict[str, Any]]:
     try:
         with open(JOBS_FILE, 'r', encoding='utf-8') as f:
             data = json.load(f)
-            return data.get("jobs", [])
+            return [_apply_scheduler_fields(job) for job in data.get("jobs", [])]
     except json.JSONDecodeError:
         # Retry with strict=False to handle bare control chars in string values
         try:
             with open(JOBS_FILE, 'r', encoding='utf-8') as f:
                 data = json.loads(f.read(), strict=False)
-                jobs = data.get("jobs", [])
+                jobs = [_apply_scheduler_fields(job) for job in data.get("jobs", [])]
                 if jobs:
                     # Auto-repair: rewrite with proper escaping
                     save_jobs(jobs)
@@ -410,6 +472,7 @@ def create_job(
     Returns:
         The created job dict
     """
+    backend = _current_scheduler_backend()
     parsed_schedule = parse_schedule(schedule)
 
     # Normalize repeat: treat 0 or negative values as None (infinite)
@@ -467,13 +530,24 @@ def create_job(
         # Delivery configuration
         "deliver": deliver,
         "origin": origin,  # Tracks where job was created for "origin" delivery
+        "scheduler_provider": backend.provider_name,
+        "scheduler_remote": None,
     }
+    job = _apply_scheduler_fields(job)
 
     jobs = load_jobs()
+    if backend.uses_remote_timing:
+        sync_result = backend.register_job(job)
+        job = _set_scheduler_sync_metadata(job, sync_result)
     jobs.append(job)
-    save_jobs(jobs)
+    try:
+        save_jobs(jobs)
+    except Exception:
+        if backend.uses_remote_timing:
+            _rollback_remote_sync(f"create job {job_id}", lambda: backend.delete_job(job))
+        raise
 
-    return job
+    return _apply_scheduler_fields(job)
 
 
 def get_job(job_id: str) -> Optional[Dict[str, Any]]:
@@ -481,13 +555,13 @@ def get_job(job_id: str) -> Optional[Dict[str, Any]]:
     jobs = load_jobs()
     for job in jobs:
         if job["id"] == job_id:
-            return _apply_skill_fields(job)
+            return _apply_scheduler_fields(job)
     return None
 
 
 def list_jobs(include_disabled: bool = False) -> List[Dict[str, Any]]:
     """List all jobs, optionally including disabled ones."""
-    jobs = [_apply_skill_fields(j) for j in load_jobs()]
+    jobs = [_apply_scheduler_fields(j) for j in load_jobs()]
     if not include_disabled:
         jobs = [j for j in jobs if j.get("enabled", True)]
     return jobs
@@ -500,7 +574,9 @@ def update_job(job_id: str, updates: Dict[str, Any]) -> Optional[Dict[str, Any]]
         if job["id"] != job_id:
             continue
 
-        updated = _apply_skill_fields({**job, **updates})
+        previous = _apply_scheduler_fields(job)
+        backend = _job_scheduler_backend(previous)
+        updated = _apply_scheduler_fields({**previous, **updates})
         schedule_changed = "schedule" in updates
 
         if "skills" in updates or "skill" in updates:
@@ -526,68 +602,132 @@ def update_job(job_id: str, updates: Dict[str, Any]) -> Optional[Dict[str, Any]]
         if updated.get("enabled", True) and updated.get("state") != "paused" and not updated.get("next_run_at"):
             updated["next_run_at"] = compute_next_run(updated["schedule"])
 
+        if backend.uses_remote_timing:
+            sync_result = backend.update_job(updated)
+            updated = _set_scheduler_sync_metadata(updated, sync_result)
+
         jobs[i] = updated
-        save_jobs(jobs)
-        return _apply_skill_fields(jobs[i])
+        try:
+            save_jobs(jobs)
+        except Exception:
+            if backend.uses_remote_timing:
+                _rollback_remote_sync(f"update job {job_id}", lambda: backend.update_job(previous))
+            raise
+        return _apply_scheduler_fields(jobs[i])
     return None
 
 
 def pause_job(job_id: str, reason: Optional[str] = None) -> Optional[Dict[str, Any]]:
     """Pause a job without deleting it."""
-    return update_job(
-        job_id,
-        {
-            "enabled": False,
-            "state": "paused",
-            "paused_at": _hermes_now().isoformat(),
-            "paused_reason": reason,
-        },
-    )
+    jobs = load_jobs()
+    for i, job in enumerate(jobs):
+        if job["id"] != job_id:
+            continue
+        previous = _apply_scheduler_fields(job)
+        backend = _job_scheduler_backend(previous)
+        updated = _apply_scheduler_fields(
+            {
+                **previous,
+                "enabled": False,
+                "state": "paused",
+                "paused_at": _hermes_now().isoformat(),
+                "paused_reason": reason,
+            }
+        )
+        if backend.uses_remote_timing:
+            sync_result = backend.pause_job(updated)
+            updated = _set_scheduler_sync_metadata(updated, sync_result)
+        jobs[i] = updated
+        try:
+            save_jobs(jobs)
+        except Exception:
+            if backend.uses_remote_timing:
+                _rollback_remote_sync(f"pause job {job_id}", lambda: backend.resume_job(previous))
+            raise
+        return _apply_scheduler_fields(updated)
+    return None
 
 
 def resume_job(job_id: str) -> Optional[Dict[str, Any]]:
     """Resume a paused job and compute the next future run from now."""
-    job = get_job(job_id)
-    if not job:
-        return None
-
-    next_run_at = compute_next_run(job["schedule"])
-    return update_job(
-        job_id,
-        {
-            "enabled": True,
-            "state": "scheduled",
-            "paused_at": None,
-            "paused_reason": None,
-            "next_run_at": next_run_at,
-        },
-    )
+    jobs = load_jobs()
+    for i, job in enumerate(jobs):
+        if job["id"] != job_id:
+            continue
+        previous = _apply_scheduler_fields(job)
+        backend = _job_scheduler_backend(previous)
+        next_run_at = compute_next_run(previous["schedule"])
+        updated = _apply_scheduler_fields(
+            {
+                **previous,
+                "enabled": True,
+                "state": "scheduled",
+                "paused_at": None,
+                "paused_reason": None,
+                "next_run_at": next_run_at,
+            }
+        )
+        if backend.uses_remote_timing:
+            sync_result = backend.resume_job(updated)
+            updated = _set_scheduler_sync_metadata(updated, sync_result)
+        jobs[i] = updated
+        try:
+            save_jobs(jobs)
+        except Exception:
+            if backend.uses_remote_timing:
+                _rollback_remote_sync(f"resume job {job_id}", lambda: backend.pause_job(previous))
+            raise
+        return _apply_scheduler_fields(updated)
+    return None
 
 
 def trigger_job(job_id: str) -> Optional[Dict[str, Any]]:
     """Schedule a job to run on the next scheduler tick."""
-    job = get_job(job_id)
-    if not job:
-        return None
-    return update_job(
-        job_id,
-        {
-            "enabled": True,
-            "state": "scheduled",
-            "paused_at": None,
-            "paused_reason": None,
-            "next_run_at": _hermes_now().isoformat(),
-        },
-    )
+    jobs = load_jobs()
+    for i, job in enumerate(jobs):
+        if job["id"] != job_id:
+            continue
+        previous = _apply_scheduler_fields(job)
+        backend = _job_scheduler_backend(previous)
+        updated = _apply_scheduler_fields(
+            {
+                **previous,
+                "enabled": True,
+                "state": "scheduled",
+                "paused_at": None,
+                "paused_reason": None,
+                "next_run_at": _hermes_now().isoformat(),
+            }
+        )
+        if backend.uses_remote_timing:
+            sync_result = backend.trigger_job(updated)
+            updated = _set_scheduler_sync_metadata(updated, sync_result)
+        jobs[i] = updated
+        try:
+            save_jobs(jobs)
+        except Exception:
+            raise
+        return _apply_scheduler_fields(updated)
+    return None
 
 
 def remove_job(job_id: str) -> bool:
     """Remove a job by ID."""
     jobs = load_jobs()
-    original_len = len(jobs)
-    jobs = [j for j in jobs if j["id"] != job_id]
-    if len(jobs) < original_len:
-        save_jobs(jobs)
+    for i, job in enumerate(jobs):
+        if job["id"] != job_id:
+            continue
+        existing = _apply_scheduler_fields(job)
+        backend = _job_scheduler_backend(existing)
+        if backend.uses_remote_timing:
+            backend.delete_job(existing)
+        remaining = jobs[:i] + jobs[i + 1 :]
+        try:
+            save_jobs(remaining)
+        except Exception:
+            if backend.uses_remote_timing:
+                _rollback_remote_sync(f"delete job {job_id}", lambda: backend.register_job(existing))
+            raise
         return True
     return False
 
@@ -659,6 +799,8 @@ def advance_next_run(job_id: str) -> bool:
         jobs = load_jobs()
         for job in jobs:
             if job["id"] == job_id:
+                if _job_scheduler_provider(job) != DEFAULT_SCHEDULER_PROVIDER:
+                    return False
                 kind = job.get("schedule", {}).get("kind")
                 if kind not in ("cron", "interval"):
                     return False
@@ -687,6 +829,8 @@ def get_due_jobs() -> List[Dict[str, Any]]:
     needs_save = False
 
     for job in jobs:
+        if _job_scheduler_provider(job) != DEFAULT_SCHEDULER_PROVIDER:
+            continue
         if not job.get("enabled", True):
             continue
 

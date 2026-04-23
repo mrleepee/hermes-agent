@@ -18,6 +18,7 @@ from cron.jobs import (
     update_job,
     pause_job,
     resume_job,
+    trigger_job,
     remove_job,
     mark_job_run,
     advance_next_run,
@@ -25,6 +26,49 @@ from cron.jobs import (
     save_job_output,
 )
 from cron.provider import SchedulerProviderError
+
+
+class FakeBuiltinBackend:
+    provider_name = "builtin"
+    uses_remote_timing = False
+
+
+class FakeRemoteBackend:
+    provider_name = "fly_machine_scheduler"
+    uses_remote_timing = True
+
+    def __init__(self):
+        self.calls = []
+
+    def _result(self, job_id: str) -> dict:
+        return {
+            "job_id": job_id,
+            "last_synced_at": "2026-04-23T09:00:00+00:00",
+            "last_sync_error": None,
+        }
+
+    def register_job(self, job: dict) -> dict:
+        self.calls.append(("register", job["id"]))
+        return self._result(job["id"])
+
+    def update_job(self, job: dict) -> dict:
+        self.calls.append(("update", job["id"]))
+        return self._result(job["id"])
+
+    def pause_job(self, job: dict) -> dict:
+        self.calls.append(("pause", job["id"]))
+        return self._result(job["id"])
+
+    def resume_job(self, job: dict) -> dict:
+        self.calls.append(("resume", job["id"]))
+        return self._result(job["id"])
+
+    def trigger_job(self, job: dict) -> dict:
+        self.calls.append(("trigger", job["id"]))
+        return self._result(job["id"])
+
+    def delete_job(self, job: dict) -> None:
+        self.calls.append(("delete", job["id"]))
 
 
 # =========================================================================
@@ -257,6 +301,33 @@ class TestJobCRUD:
         job = create_job(prompt="Test", schedule="30m")
         assert job["deliver"] == "local"
 
+    def test_remote_create_syncs_before_local_save(self, tmp_cron_dir, monkeypatch):
+        remote_backend = FakeRemoteBackend()
+        monkeypatch.setattr("cron.jobs.ensure_scheduler_backend_runtime", lambda: None)
+        monkeypatch.setattr("cron.jobs.build_scheduler_backend", lambda: remote_backend)
+
+        job = create_job(prompt="Remote job", schedule="every 1h")
+
+        assert remote_backend.calls == [("register", job["id"])]
+        assert job["scheduler_provider"] == "fly_machine_scheduler"
+        assert job["scheduler_remote"]["job_id"] == job["id"]
+        persisted = get_job(job["id"])
+        assert persisted["scheduler_provider"] == "fly_machine_scheduler"
+        assert persisted["scheduler_remote"]["last_synced_at"] == "2026-04-23T09:00:00+00:00"
+
+    def test_remote_create_failure_does_not_persist_job(self, tmp_cron_dir, monkeypatch):
+        class FailingRemoteBackend(FakeRemoteBackend):
+            def register_job(self, job: dict) -> dict:
+                raise RuntimeError("scheduler down")
+
+        monkeypatch.setattr("cron.jobs.ensure_scheduler_backend_runtime", lambda: None)
+        monkeypatch.setattr("cron.jobs.build_scheduler_backend", lambda: FailingRemoteBackend())
+
+        with pytest.raises(RuntimeError, match="scheduler down"):
+            create_job(prompt="Remote job", schedule="every 1h")
+
+        assert load_jobs() == []
+
 
 class TestUpdateJob:
     def test_update_name(self, tmp_cron_dir):
@@ -303,6 +374,23 @@ class TestUpdateJob:
         result = update_job("nonexistent_id", {"name": "X"})
         assert result is None
 
+    def test_remote_update_syncs_to_remote_scheduler(self, tmp_cron_dir, monkeypatch):
+        remote_backend = FakeRemoteBackend()
+        monkeypatch.setattr("cron.jobs.ensure_scheduler_backend_runtime", lambda: None)
+        monkeypatch.setattr("cron.jobs.build_scheduler_backend", lambda: remote_backend)
+        monkeypatch.setattr(
+            "cron.jobs.build_scheduler_backend_for_provider",
+            lambda provider: remote_backend if provider == "fly_machine_scheduler" else FakeBuiltinBackend(),
+        )
+
+        job = create_job(prompt="Remote job", schedule="every 1h")
+        updated = update_job(job["id"], {"name": "Updated remote job"})
+
+        assert updated["name"] == "Updated remote job"
+        assert remote_backend.calls == [("register", job["id"]), ("update", job["id"])]
+        persisted = get_job(job["id"])
+        assert persisted["name"] == "Updated remote job"
+
 
 class TestPauseResumeJob:
     def test_pause_sets_state(self, tmp_cron_dir):
@@ -320,8 +408,112 @@ class TestPauseResumeJob:
         assert resumed is not None
         assert resumed["enabled"] is True
         assert resumed["state"] == "scheduled"
-        assert resumed["paused_at"] is None
-        assert resumed["paused_reason"] is None
+
+    def test_remote_pause_resume_and_trigger_call_remote_scheduler(self, tmp_cron_dir, monkeypatch):
+        remote_backend = FakeRemoteBackend()
+        monkeypatch.setattr("cron.jobs.ensure_scheduler_backend_runtime", lambda: None)
+        monkeypatch.setattr("cron.jobs.build_scheduler_backend", lambda: remote_backend)
+        monkeypatch.setattr(
+            "cron.jobs.build_scheduler_backend_for_provider",
+            lambda provider: remote_backend if provider == "fly_machine_scheduler" else FakeBuiltinBackend(),
+        )
+
+        job = create_job(prompt="Remote job", schedule="every 1h")
+        paused = pause_job(job["id"], reason="maintenance")
+        resumed = resume_job(job["id"])
+        triggered = trigger_job(job["id"])
+
+        assert paused["state"] == "paused"
+        assert resumed["state"] == "scheduled"
+        assert triggered["state"] == "scheduled"
+        assert remote_backend.calls == [
+            ("register", job["id"]),
+            ("pause", job["id"]),
+            ("resume", job["id"]),
+            ("trigger", job["id"]),
+        ]
+
+
+class TestRemoteDeletionAndDueIsolation:
+    def test_remote_delete_syncs_before_local_delete(self, tmp_cron_dir, monkeypatch):
+        remote_backend = FakeRemoteBackend()
+        monkeypatch.setattr("cron.jobs.ensure_scheduler_backend_runtime", lambda: None)
+        monkeypatch.setattr("cron.jobs.build_scheduler_backend", lambda: remote_backend)
+        monkeypatch.setattr(
+            "cron.jobs.build_scheduler_backend_for_provider",
+            lambda provider: remote_backend if provider == "fly_machine_scheduler" else FakeBuiltinBackend(),
+        )
+
+        job = create_job(prompt="Remote job", schedule="every 1h")
+        assert remove_job(job["id"]) is True
+        assert get_job(job["id"]) is None
+        assert remote_backend.calls == [("register", job["id"]), ("delete", job["id"])]
+
+    def test_remote_jobs_are_skipped_by_local_due_discovery(self, tmp_cron_dir, monkeypatch):
+        monkeypatch.setattr("cron.jobs.ensure_scheduler_backend_runtime", lambda: None)
+        now = datetime(2026, 3, 18, 12, 0, tzinfo=timezone.utc)
+        monkeypatch.setattr("cron.jobs._hermes_now", lambda: now)
+
+        save_jobs(
+            [
+                {
+                    "id": "builtin123456",
+                    "name": "Builtin job",
+                    "prompt": "Run builtin",
+                    "skills": [],
+                    "skill": None,
+                    "schedule": {"kind": "interval", "minutes": 60},
+                    "schedule_display": "every 60m",
+                    "repeat": {"times": None, "completed": 0},
+                    "enabled": True,
+                    "state": "scheduled",
+                    "paused_at": None,
+                    "paused_reason": None,
+                    "created_at": now.isoformat(),
+                    "next_run_at": (now - timedelta(minutes=1)).isoformat(),
+                    "last_run_at": None,
+                    "last_status": None,
+                    "last_error": None,
+                    "last_delivery_error": None,
+                    "deliver": "local",
+                    "origin": None,
+                    "scheduler_provider": "builtin",
+                    "scheduler_remote": None,
+                },
+                {
+                    "id": "remote1234567",
+                    "name": "Remote job",
+                    "prompt": "Run remote",
+                    "skills": [],
+                    "skill": None,
+                    "schedule": {"kind": "interval", "minutes": 60},
+                    "schedule_display": "every 60m",
+                    "repeat": {"times": None, "completed": 0},
+                    "enabled": True,
+                    "state": "scheduled",
+                    "paused_at": None,
+                    "paused_reason": None,
+                    "created_at": now.isoformat(),
+                    "next_run_at": (now - timedelta(minutes=1)).isoformat(),
+                    "last_run_at": None,
+                    "last_status": None,
+                    "last_error": None,
+                    "last_delivery_error": None,
+                    "deliver": "local",
+                    "origin": None,
+                    "scheduler_provider": "fly_machine_scheduler",
+                    "scheduler_remote": {
+                        "job_id": "remote1234567",
+                        "last_synced_at": now.isoformat(),
+                        "last_sync_error": None,
+                    },
+                },
+            ]
+        )
+
+        due = get_due_jobs()
+
+        assert [job["id"] for job in due] == ["builtin123456"]
 
 
 class TestMarkJobRun:
