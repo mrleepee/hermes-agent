@@ -1077,8 +1077,10 @@ def _sync_remote_occurrence_completion(job: dict, occurrence_id: str, *, success
     if backend.provider_name != REMOTE_SCHEDULER_PROVIDER:
         return
     if success:
+        logger.info("Acknowledging remote scheduler occurrence %s for job %s", occurrence_id, job["id"])
         backend.acknowledge_occurrence(occurrence_id)
     else:
+        logger.warning("Reporting remote scheduler occurrence failure %s for job %s: %s", occurrence_id, job["id"], error)
         backend.fail_occurrence(occurrence_id, error or "Hermes job failed")
 
 
@@ -1175,6 +1177,7 @@ def process_remote_dispatch(
             "failed": "duplicate_failed",
             "received": "duplicate_running",
         }.get(state, "duplicate_running")
+        logger.info("Ignoring duplicate remote occurrence %s for job %s with receipt state %s", occurrence_id, job_id, state or "unknown")
         return {
             "ok": True,
             "job_id": job_id,
@@ -1185,8 +1188,15 @@ def process_remote_dispatch(
 
     job = get_job(job_id)
     if not job:
+        logger.warning("Rejecting remote occurrence %s for unknown job %s", occurrence_id, job_id)
         return {"ok": False, "job_id": job_id, "occurrence_id": occurrence_id, "state": "rejected_unknown_job", "http_status": 404}
     if str(job.get("scheduler_provider") or "").strip().lower() != REMOTE_SCHEDULER_PROVIDER:
+        logger.warning(
+            "Rejecting remote occurrence %s for job %s due to provider mismatch (%s)",
+            occurrence_id,
+            job_id,
+            job.get("scheduler_provider"),
+        )
         return {
             "ok": False,
             "job_id": job_id,
@@ -1195,6 +1205,7 @@ def process_remote_dispatch(
             "http_status": 409,
         }
     if not job.get("enabled", True) or job.get("state") == "paused":
+        logger.info("Rejecting remote occurrence %s for paused job %s", occurrence_id, job_id)
         return {"ok": False, "job_id": job_id, "occurrence_id": occurrence_id, "state": "rejected_paused", "http_status": 409}
 
     now = _hermes_now().isoformat()
@@ -1226,6 +1237,7 @@ def process_remote_dispatch(
             "started_at": _hermes_now().isoformat(),
         },
     )
+    logger.info("Accepted remote scheduler occurrence %s for job %s", occurrence_id, job_id)
 
     if run_async:
         worker = threading.Thread(

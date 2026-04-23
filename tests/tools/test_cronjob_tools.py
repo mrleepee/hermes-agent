@@ -172,6 +172,37 @@ class TestUnifiedCronjobTool:
         assert updated["job"]["provider"] == "openrouter"
         assert updated["job"]["base_url"] is None
 
+    def test_format_includes_remote_scheduler_metadata(self):
+        remote_job = {
+            "id": "aabbccddeeff",
+            "name": "Remote job",
+            "prompt": "Check scheduler",
+            "skills": [],
+            "skill": None,
+            "schedule_display": "every 60m",
+            "repeat": {"times": None, "completed": 0},
+            "deliver": "local",
+            "next_run_at": "2026-04-23T09:00:00+00:00",
+            "last_run_at": None,
+            "last_status": None,
+            "last_delivery_error": None,
+            "enabled": True,
+            "state": "scheduled",
+            "paused_at": None,
+            "paused_reason": None,
+            "scheduler_provider": "fly_machine_scheduler",
+            "scheduler_remote": {
+                "job_id": "aabbccddeeff",
+                "last_synced_at": "2026-04-23T08:59:00+00:00",
+                "last_sync_error": None,
+            },
+        }
+        with pytest.MonkeyPatch.context() as monkeypatch:
+            monkeypatch.setattr("tools.cronjob_tools.list_jobs", lambda include_disabled=False: [remote_job])
+            listing = json.loads(cronjob(action="list"))
+        assert listing["jobs"][0]["scheduler_provider"] == "fly_machine_scheduler"
+        assert listing["jobs"][0]["scheduler_remote_job_id"] == "aabbccddeeff"
+
     def test_create_skill_backed_job(self):
         result = json.loads(
             cronjob(

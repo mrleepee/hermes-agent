@@ -537,6 +537,7 @@ def create_job(
 
     jobs = load_jobs()
     if backend.uses_remote_timing:
+        logger.info("Creating cron job %s via remote scheduler provider '%s'", job_id, backend.provider_name)
         sync_result = backend.register_job(job)
         job = _set_scheduler_sync_metadata(job, sync_result)
     jobs.append(job)
@@ -603,6 +604,7 @@ def update_job(job_id: str, updates: Dict[str, Any]) -> Optional[Dict[str, Any]]
             updated["next_run_at"] = compute_next_run(updated["schedule"])
 
         if backend.uses_remote_timing:
+            logger.info("Updating cron job %s via remote scheduler provider '%s'", job_id, backend.provider_name)
             sync_result = backend.update_job(updated)
             updated = _set_scheduler_sync_metadata(updated, sync_result)
 
@@ -635,6 +637,7 @@ def pause_job(job_id: str, reason: Optional[str] = None) -> Optional[Dict[str, A
             }
         )
         if backend.uses_remote_timing:
+            logger.info("Pausing cron job %s via remote scheduler provider '%s'", job_id, backend.provider_name)
             sync_result = backend.pause_job(updated)
             updated = _set_scheduler_sync_metadata(updated, sync_result)
         jobs[i] = updated
@@ -668,6 +671,7 @@ def resume_job(job_id: str) -> Optional[Dict[str, Any]]:
             }
         )
         if backend.uses_remote_timing:
+            logger.info("Resuming cron job %s via remote scheduler provider '%s'", job_id, backend.provider_name)
             sync_result = backend.resume_job(updated)
             updated = _set_scheduler_sync_metadata(updated, sync_result)
         jobs[i] = updated
@@ -700,6 +704,7 @@ def trigger_job(job_id: str) -> Optional[Dict[str, Any]]:
             }
         )
         if backend.uses_remote_timing:
+            logger.info("Triggering cron job %s via remote scheduler provider '%s'", job_id, backend.provider_name)
             sync_result = backend.trigger_job(updated)
             updated = _set_scheduler_sync_metadata(updated, sync_result)
         jobs[i] = updated
@@ -720,6 +725,7 @@ def remove_job(job_id: str) -> bool:
         existing = _apply_scheduler_fields(job)
         backend = _job_scheduler_backend(existing)
         if backend.uses_remote_timing:
+            logger.info("Deleting cron job %s via remote scheduler provider '%s'", job_id, backend.provider_name)
             backend.delete_job(existing)
         remaining = jobs[:i] + jobs[i + 1 :]
         try:
@@ -830,6 +836,7 @@ def get_due_jobs() -> List[Dict[str, Any]]:
 
     for job in jobs:
         if _job_scheduler_provider(job) != DEFAULT_SCHEDULER_PROVIDER:
+            logger.debug("Skipping remote-scheduled job %s during local due-job scan", job["id"])
             continue
         if not job.get("enabled", True):
             continue

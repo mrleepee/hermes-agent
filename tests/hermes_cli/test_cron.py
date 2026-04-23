@@ -5,7 +5,7 @@ from argparse import Namespace
 import pytest
 
 from cron.jobs import create_job, get_job, list_jobs
-from hermes_cli.cron import cron_command
+from hermes_cli.cron import cron_command, cron_list
 
 
 @pytest.fixture()
@@ -105,3 +105,33 @@ class TestCronCommandLifecycle:
         assert len(jobs) == 1
         assert jobs[0]["skills"] == ["blogwatcher", "maps"]
         assert jobs[0]["name"] == "Skill combo"
+
+    def test_list_shows_scheduler_provider(self, tmp_cron_dir, monkeypatch, capsys):
+        monkeypatch.setattr(
+            "cron.jobs.list_jobs",
+            lambda include_disabled=False: [
+                {
+                    "id": "aabbccddeeff",
+                    "name": "Remote job",
+                    "schedule_display": "every 60m",
+                    "state": "scheduled",
+                    "enabled": True,
+                    "next_run_at": "2026-04-23T09:00:00+00:00",
+                    "repeat": {"times": None, "completed": 0},
+                    "deliver": "local",
+                    "skills": [],
+                    "scheduler_provider": "fly_machine_scheduler",
+                    "scheduler_remote": {
+                        "job_id": "aabbccddeeff",
+                        "last_synced_at": "2026-04-23T08:59:00+00:00",
+                        "last_sync_error": None,
+                    },
+                }
+            ],
+        )
+
+        cron_list()
+
+        out = capsys.readouterr().out
+        assert "Scheduler: fly_machine_scheduler" in out
+        assert "Synced:    2026-04-23T08:59:00+00:00" in out

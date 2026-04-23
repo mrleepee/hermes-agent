@@ -192,6 +192,8 @@ def _validate_cron_script_path(script: Optional[str]) -> Optional[str]:
 def _format_job(job: Dict[str, Any]) -> Dict[str, Any]:
     prompt = job.get("prompt", "")
     skills = _canonical_skills(job.get("skill"), job.get("skills"))
+    scheduler_provider = str(job.get("scheduler_provider") or "builtin")
+    scheduler_remote = job.get("scheduler_remote") if isinstance(job.get("scheduler_remote"), dict) else {}
     result = {
         "job_id": job["id"],
         "name": job["name"],
@@ -212,9 +214,14 @@ def _format_job(job: Dict[str, Any]) -> Dict[str, Any]:
         "state": job.get("state", "scheduled" if job.get("enabled", True) else "paused"),
         "paused_at": job.get("paused_at"),
         "paused_reason": job.get("paused_reason"),
+        "scheduler_provider": scheduler_provider,
     }
     if job.get("script"):
         result["script"] = job["script"]
+    if scheduler_provider != "builtin":
+        result["scheduler_remote_job_id"] = scheduler_remote.get("job_id")
+        result["scheduler_last_synced_at"] = scheduler_remote.get("last_synced_at")
+        result["scheduler_last_sync_error"] = scheduler_remote.get("last_sync_error")
     return result
 
 

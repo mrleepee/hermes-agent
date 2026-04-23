@@ -88,6 +88,14 @@ def cron_list(show_all: bool = False):
         print(f"    Repeat:    {repeat_str}")
         print(f"    Next run:  {next_run}")
         print(f"    Deliver:   {deliver_str}")
+        scheduler_provider = str(job.get("scheduler_provider") or "builtin")
+        print(f"    Scheduler: {scheduler_provider}")
+        scheduler_remote = job.get("scheduler_remote") if isinstance(job.get("scheduler_remote"), dict) else None
+        if scheduler_remote:
+            if scheduler_remote.get("last_synced_at"):
+                print(f"    Synced:    {scheduler_remote['last_synced_at']}")
+            if scheduler_remote.get("last_sync_error"):
+                print(f"    Sync err:  {scheduler_remote['last_sync_error']}")
         if skills:
             print(f"    Skills:    {', '.join(skills)}")
         script = job.get("script")
