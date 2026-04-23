@@ -17,6 +17,7 @@ import os
 import subprocess
 import sys
 import threading
+from datetime import datetime, timedelta
 
 # fcntl is Unix-only; on Windows use msvcrt for file locking
 try:
@@ -97,6 +98,7 @@ _hermes_home = get_hermes_home()
 # File-based lock prevents concurrent ticks from gateway + daemon + systemd timer
 _LOCK_DIR = _hermes_home / "cron"
 _LOCK_FILE = _LOCK_DIR / ".tick.lock"
+_REMOTE_DISPATCH_STALE_RECEIPT_GRACE = timedelta(minutes=5)
 
 
 def _resolve_origin(job: dict) -> Optional[dict]:
@@ -109,6 +111,55 @@ def _resolve_origin(job: dict) -> Optional[dict]:
     if platform and chat_id:
         return origin
     return None
+
+
+def _parse_receipt_timestamp(value) -> Optional[datetime]:
+    raw = str(value or "").strip()
+    if not raw:
+        return None
+    try:
+        return datetime.fromisoformat(raw.replace("Z", "+00:00"))
+    except ValueError:
+        return None
+
+
+def _pid_is_active(pid_value) -> bool:
+    try:
+        pid = int(pid_value)
+    except (TypeError, ValueError):
+        return False
+    if pid <= 0:
+        return False
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+    except OSError:
+        return False
+    return True
+
+
+def _should_recover_inflight_receipt(receipt: dict, *, now: datetime) -> bool:
+    state = str(receipt.get("state") or "").strip().lower()
+    if state not in {"received", "running"}:
+        return False
+
+    owner_pid = receipt.get("worker_pid")
+    if owner_pid in (None, ""):
+        owner_pid = receipt.get("received_by_pid")
+    if owner_pid not in (None, ""):
+        return not _pid_is_active(owner_pid)
+
+    timestamp = _parse_receipt_timestamp(receipt.get("started_at"))
+    if timestamp is None:
+        timestamp = _parse_receipt_timestamp(receipt.get("received_at"))
+    if timestamp is None:
+        return False
+    if timestamp.tzinfo is None:
+        timestamp = timestamp.astimezone()
+    return (now - timestamp) >= _REMOTE_DISPATCH_STALE_RECEIPT_GRACE
 
 
 def _get_home_target_chat_id(platform_name: str) -> str:
@@ -1168,23 +1219,54 @@ def process_remote_dispatch(
             "http_status": 400,
         }
 
+    now_dt = _hermes_now()
+    recovered_existing_receipt = False
     existing_receipt = get_receipt(occurrence_id)
     if existing_receipt is not None:
         state = str(existing_receipt.get("state") or "").strip().lower()
-        duplicate_state = {
-            "running": "duplicate_running",
-            "completed": "duplicate_completed",
-            "failed": "duplicate_failed",
-            "received": "duplicate_running",
-        }.get(state, "duplicate_running")
-        logger.info("Ignoring duplicate remote occurrence %s for job %s with receipt state %s", occurrence_id, job_id, state or "unknown")
-        return {
-            "ok": True,
-            "job_id": job_id,
-            "occurrence_id": occurrence_id,
-            "state": duplicate_state,
-            "http_status": 200,
-        }
+        if _should_recover_inflight_receipt(existing_receipt, now=now_dt):
+            recovered_existing_receipt = True
+            logger.warning(
+                "Recovering stale remote occurrence %s for job %s from receipt state %s",
+                occurrence_id,
+                job_id,
+                state or "unknown",
+            )
+            existing_receipt = update_receipt(
+                occurrence_id,
+                {
+                    "state": "received",
+                    "received_at": now_dt.isoformat(),
+                    "started_at": None,
+                    "finished_at": None,
+                    "error": None,
+                    "received_by_pid": os.getpid(),
+                    "worker_pid": None,
+                    "recovered_from_state": state or None,
+                    "recovered_at": now_dt.isoformat(),
+                },
+            )
+            state = "received"
+        else:
+            duplicate_state = {
+                "running": "duplicate_running",
+                "completed": "duplicate_completed",
+                "failed": "duplicate_failed",
+                "received": "duplicate_running",
+            }.get(state, "duplicate_running")
+            logger.info(
+                "Ignoring duplicate remote occurrence %s for job %s with receipt state %s",
+                occurrence_id,
+                job_id,
+                state or "unknown",
+            )
+            return {
+                "ok": True,
+                "job_id": job_id,
+                "occurrence_id": occurrence_id,
+                "state": duplicate_state,
+                "http_status": 200,
+            }
 
     job = get_job(job_id)
     if not job:
@@ -1208,19 +1290,23 @@ def process_remote_dispatch(
         logger.info("Rejecting remote occurrence %s for paused job %s", occurrence_id, job_id)
         return {"ok": False, "job_id": job_id, "occurrence_id": occurrence_id, "state": "rejected_paused", "http_status": 409}
 
-    now = _hermes_now().isoformat()
-    _, created = create_receipt_if_absent(
-        {
-            "occurrence_id": occurrence_id,
-            "job_id": job_id,
-            "scheduled_for": scheduled_for,
-            "state": "received",
-            "received_at": now,
-            "started_at": None,
-            "finished_at": None,
-            "error": None,
-        }
-    )
+    now = now_dt.isoformat()
+    created = recovered_existing_receipt
+    if not recovered_existing_receipt:
+        _, created = create_receipt_if_absent(
+            {
+                "occurrence_id": occurrence_id,
+                "job_id": job_id,
+                "scheduled_for": scheduled_for,
+                "state": "received",
+                "received_at": now,
+                "started_at": None,
+                "finished_at": None,
+                "error": None,
+                "received_by_pid": os.getpid(),
+                "worker_pid": None,
+            }
+        )
     if not created:
         return {
             "ok": True,
@@ -1235,6 +1321,7 @@ def process_remote_dispatch(
         {
             "state": "running",
             "started_at": _hermes_now().isoformat(),
+            "worker_pid": os.getpid(),
         },
     )
     logger.info("Accepted remote scheduler occurrence %s for job %s", occurrence_id, job_id)

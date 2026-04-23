@@ -1,11 +1,12 @@
 """Tests for remote scheduler dispatch execution and idempotency."""
 
+import os
 from datetime import datetime, timezone
 from unittest.mock import MagicMock, patch
 
 import pytest
 
-from cron.dispatch_receipts import get_receipt
+from cron.dispatch_receipts import create_receipt_if_absent, get_receipt
 from cron.jobs import save_jobs
 from cron.scheduler import process_remote_dispatch
 
@@ -117,6 +118,63 @@ class TestRemoteDispatchExecution:
         assert first["state"] == "accepted"
         assert second["state"] == "duplicate_completed"
         assert run_job.call_count == 1
+
+    def test_running_occurrence_with_live_worker_pid_is_suppressed(self, remote_dispatch_env, monkeypatch):
+        backend = FakeRemoteBackend()
+        save_jobs([_remote_job()])
+        create_receipt_if_absent(
+            {
+                "occurrence_id": "occ_20260423T090000_aabbccddeeff",
+                "job_id": "aabbccddeeff",
+                "scheduled_for": "2026-04-23T09:00:00+00:00",
+                "state": "running",
+                "received_at": "2026-04-23T09:00:00+00:00",
+                "started_at": "2026-04-23T09:00:10+00:00",
+                "finished_at": None,
+                "error": None,
+                "received_by_pid": os.getpid(),
+                "worker_pid": os.getpid(),
+            }
+        )
+        monkeypatch.setattr("cron.scheduler.build_scheduler_backend_for_provider", lambda provider: backend)
+        run_job = MagicMock(return_value=(True, "# output", "All good", None))
+
+        with patch("cron.scheduler.run_job", run_job):
+            result = process_remote_dispatch(_payload(), run_async=False)
+
+        assert result["state"] == "duplicate_running"
+        assert run_job.call_count == 0
+
+    def test_running_occurrence_with_dead_worker_pid_is_recovered(self, remote_dispatch_env, monkeypatch):
+        backend = FakeRemoteBackend()
+        save_jobs([_remote_job()])
+        create_receipt_if_absent(
+            {
+                "occurrence_id": "occ_20260423T090000_aabbccddeeff",
+                "job_id": "aabbccddeeff",
+                "scheduled_for": "2026-04-23T09:00:00+00:00",
+                "state": "running",
+                "received_at": "2026-04-23T09:00:00+00:00",
+                "started_at": "2026-04-23T09:00:10+00:00",
+                "finished_at": None,
+                "error": None,
+                "received_by_pid": 999999,
+                "worker_pid": 999999,
+            }
+        )
+        monkeypatch.setattr("cron.scheduler.build_scheduler_backend_for_provider", lambda provider: backend)
+        monkeypatch.setattr("cron.scheduler._pid_is_active", lambda pid: False)
+
+        with patch("cron.scheduler.run_job", return_value=(True, "# output", "All good", None)) as run_job, patch(
+            "cron.scheduler.save_job_output", return_value="/tmp/out.md"
+        ), patch("cron.scheduler._deliver_result", return_value=None), patch("cron.scheduler.mark_job_run"):
+            result = process_remote_dispatch(_payload(), run_async=False)
+
+        assert result["state"] == "accepted"
+        assert run_job.call_count == 1
+        receipt = get_receipt("occ_20260423T090000_aabbccddeeff")
+        assert receipt["state"] == "completed"
+        assert receipt["recovered_from_state"] == "running"
 
     def test_failed_dispatch_reports_failure(self, remote_dispatch_env, monkeypatch):
         backend = FakeRemoteBackend()
