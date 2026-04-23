@@ -546,7 +546,7 @@ try:
         resume_job as _cron_resume,
         trigger_job as _cron_trigger,
     )
-    from cron.provider import ensure_supported_scheduler_provider as _cron_validate_provider
+    from cron.provider import ensure_scheduler_backend_runtime as _cron_validate_provider
     _CRON_AVAILABLE = True
 except ImportError:
     _cron_list = None

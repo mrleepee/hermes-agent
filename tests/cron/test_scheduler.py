@@ -1152,8 +1152,10 @@ class TestSchedulerProviderValidation:
         from cron.scheduler import tick
 
         with patch(
-            "cron.scheduler.ensure_supported_scheduler_provider",
-            side_effect=SchedulerProviderError("Unsupported cron scheduler provider 'banana'. Supported providers: builtin."),
+            "cron.scheduler.ensure_scheduler_backend_runtime",
+            side_effect=SchedulerProviderError(
+                "Unsupported cron scheduler provider 'banana'. Supported providers: builtin, fly_machine_scheduler."
+            ),
         ):
             with caplog.at_level(logging.ERROR, logger="cron.scheduler"):
                 with pytest.raises(SchedulerProviderError, match="Unsupported cron scheduler provider 'banana'"):

@@ -1,5 +1,19 @@
 # Multi-Scheduler Providers - Implementation Spec
 
+This draft remains useful as background, but it is no longer the primary implementation spec for the next Hermes PR.
+
+For the next implementation step, use these documents as the source of truth:
+
+- `/Users/lpollington/Dev/liber_agent_platform/specs/hermes-scheduler-integration.md`
+- `/Users/lpollington/Dev/liber_agent_platform/implementation/hermes-scheduler-hermes-side-architecture.md`
+- `/Users/lpollington/Dev/liber_agent_platform/implementation/hermes-scheduler-hermes-side-implementation-plan.md`
+
+Important update:
+
+- the recommended remote provider name is now `fly_machine_scheduler`
+- this is more precise than the earlier `fly_io` label
+- the next PR should follow the focused Hermes integration docs above, not this broader draft
+
 This spec defines how Hermes should support multiple scheduler providers behind one stable scheduled-jobs model. The immediate goal is to preserve current Hermes scheduler behavior for all existing users while adding a second provider, `fly_io`, without forcing API, CLI, or tool callers to change how they create or manage jobs. This spec is for the `codex/multi-scheduler-types` branch and is currently `draft`.
 
 **Initiative:** Hermes multi-scheduler providers
