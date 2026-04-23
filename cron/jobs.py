@@ -133,6 +133,13 @@ def _rollback_remote_sync(label: str, rollback) -> None:
         logger.warning("Failed remote scheduler rollback for %s: %s", label, exc)
 
 
+def _restore_remote_job_state(backend, job: Dict[str, Any]) -> None:
+    """Best-effort remote restore used when local persistence fails after a remote mutation."""
+    backend.register_job(job)
+    if job.get("state") == "paused" or not job.get("enabled", True):
+        backend.pause_job(job)
+
+
 def _secure_dir(path: Path):
     """Set directory to owner-only access (0700). No-op on Windows."""
     try:
@@ -732,7 +739,7 @@ def remove_job(job_id: str) -> bool:
             save_jobs(remaining)
         except Exception:
             if backend.uses_remote_timing:
-                _rollback_remote_sync(f"delete job {job_id}", lambda: backend.register_job(existing))
+                _rollback_remote_sync(f"delete job {job_id}", lambda: _restore_remote_job_state(backend, existing))
             raise
         return True
     return False

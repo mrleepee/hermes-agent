@@ -449,6 +449,34 @@ class TestRemoteDeletionAndDueIsolation:
         assert get_job(job["id"]) is None
         assert remote_backend.calls == [("register", job["id"]), ("delete", job["id"])]
 
+    def test_remote_delete_rollback_restores_paused_state(self, tmp_cron_dir, monkeypatch):
+        remote_backend = FakeRemoteBackend()
+        monkeypatch.setattr("cron.jobs.ensure_scheduler_backend_runtime", lambda: None)
+        monkeypatch.setattr("cron.jobs.build_scheduler_backend", lambda: remote_backend)
+        monkeypatch.setattr(
+            "cron.jobs.build_scheduler_backend_for_provider",
+            lambda provider: remote_backend if provider == "fly_machine_scheduler" else FakeBuiltinBackend(),
+        )
+
+        job = create_job(prompt="Remote job", schedule="every 1h")
+        paused = pause_job(job["id"], reason="maintenance")
+
+        def fail_save(_jobs):
+            raise OSError("disk full")
+
+        monkeypatch.setattr("cron.jobs.save_jobs", fail_save)
+
+        with pytest.raises(OSError, match="disk full"):
+            remove_job(job["id"])
+
+        assert remote_backend.calls == [
+            ("register", job["id"]),
+            ("pause", job["id"]),
+            ("delete", job["id"]),
+            ("register", paused["id"]),
+            ("pause", paused["id"]),
+        ]
+
     def test_remote_jobs_are_skipped_by_local_due_discovery(self, tmp_cron_dir, monkeypatch):
         monkeypatch.setattr("cron.jobs.ensure_scheduler_backend_runtime", lambda: None)
         now = datetime(2026, 3, 18, 12, 0, tzinfo=timezone.utc)
