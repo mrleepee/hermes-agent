@@ -43,6 +43,18 @@ class SchedulerRemoteClient:
         encoded_job_id = quote(job_id, safe="")
         self._request_json("DELETE", f"/v1/jobs/{encoded_job_id}")
 
+    def acknowledge_occurrence(self, occurrence_id: str) -> dict[str, Any]:
+        encoded_occurrence_id = quote(occurrence_id, safe="")
+        return self._request_json("POST", f"/v1/occurrences/{encoded_occurrence_id}/ack").get("occurrence") or {}
+
+    def fail_occurrence(self, occurrence_id: str, reason: str) -> dict[str, Any]:
+        encoded_occurrence_id = quote(occurrence_id, safe="")
+        return self._request_json(
+            "POST",
+            f"/v1/occurrences/{encoded_occurrence_id}/fail",
+            {"reason": reason},
+        ).get("occurrence") or {}
+
     def _request_json(
         self,
         method: str,

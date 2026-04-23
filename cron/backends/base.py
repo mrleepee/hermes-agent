@@ -75,6 +75,12 @@ class SchedulerBackend(ABC):
     def delete_job(self, job: dict[str, Any]) -> None:
         return None
 
+    def acknowledge_occurrence(self, occurrence_id: str) -> None:
+        return None
+
+    def fail_occurrence(self, occurrence_id: str, reason: str) -> None:
+        return None
+
     @staticmethod
     def _sync_metadata(job_id: str, error: str | None = None) -> dict[str, Any]:
         return {

@@ -546,7 +546,11 @@ try:
         resume_job as _cron_resume,
         trigger_job as _cron_trigger,
     )
-    from cron.provider import ensure_scheduler_backend_runtime as _cron_validate_provider
+    from cron.provider import (
+        ensure_scheduler_backend_runtime as _cron_validate_provider,
+        get_scheduler_backend_config as _cron_backend_config,
+    )
+    from cron.scheduler import process_remote_dispatch as _cron_process_remote_dispatch
     _CRON_AVAILABLE = True
 except ImportError:
     _cron_list = None
@@ -558,6 +562,8 @@ except ImportError:
     _cron_resume = None
     _cron_trigger = None
     _cron_validate_provider = None
+    _cron_backend_config = None
+    _cron_process_remote_dispatch = None
 
 
 class APIServerAdapter(BasePlatformAdapter):
@@ -680,6 +686,24 @@ class APIServerAdapter(BasePlatformAdapter):
             {"error": {"message": "Invalid API key", "type": "invalid_request_error", "code": "invalid_api_key"}},
             status=401,
         )
+
+    @staticmethod
+    def _check_scheduler_dispatch_auth(request: "web.Request") -> Optional["web.Response"]:
+        if not _CRON_AVAILABLE or _cron_backend_config is None:
+            return web.json_response({"error": "Cron module not available"}, status=501)
+        try:
+            token = (_cron_backend_config().remote.dispatch_token or "").strip()
+        except Exception as exc:
+            return web.json_response({"error": str(exc)}, status=500)
+        if not token:
+            return web.json_response({"error": "Scheduler dispatch token is not configured"}, status=503)
+
+        auth_header = request.headers.get("Authorization", "")
+        if auth_header.startswith("Bearer "):
+            candidate = auth_header[7:].strip()
+            if hmac.compare_digest(candidate, token):
+                return None
+        return web.json_response({"error": "Unauthorized"}, status=401)
 
     # ------------------------------------------------------------------
     # Session DB helper
@@ -2109,6 +2133,25 @@ class APIServerAdapter(BasePlatformAdapter):
         except Exception as e:
             return web.json_response({"error": str(e)}, status=500)
 
+    async def _handle_internal_cron_dispatch(self, request: "web.Request") -> "web.Response":
+        """POST /internal/cron/dispatch — accept remote scheduler occurrences."""
+        auth_err = self._check_scheduler_dispatch_auth(request)
+        if auth_err:
+            return auth_err
+        if not _CRON_AVAILABLE or _cron_process_remote_dispatch is None:
+            return web.json_response({"error": "Cron module not available"}, status=501)
+        try:
+            body = await request.json()
+        except Exception:
+            return web.json_response({"error": "Request body must be valid JSON"}, status=400)
+
+        try:
+            result = _cron_process_remote_dispatch(body, run_async=True)
+            status = int(result.pop("http_status", 202))
+            return web.json_response(result, status=status)
+        except Exception as e:
+            return web.json_response({"error": str(e)}, status=500)
+
     # ------------------------------------------------------------------
     # Output extraction helper
     # ------------------------------------------------------------------
@@ -2514,6 +2557,7 @@ class APIServerAdapter(BasePlatformAdapter):
             self._app.router.add_post("/api/jobs/{job_id}/pause", self._handle_pause_job)
             self._app.router.add_post("/api/jobs/{job_id}/resume", self._handle_resume_job)
             self._app.router.add_post("/api/jobs/{job_id}/run", self._handle_run_job)
+            self._app.router.add_post("/internal/cron/dispatch", self._handle_internal_cron_dispatch)
             # Structured event streaming
             self._app.router.add_post("/v1/runs", self._handle_runs)
             self._app.router.add_get("/v1/runs/{run_id}/events", self._handle_run_events)

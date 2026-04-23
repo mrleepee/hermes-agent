@@ -68,6 +68,12 @@ class FlyMachineSchedulerBackend(SchedulerBackend):
     def delete_job(self, job: dict[str, Any]) -> None:
         self._client.delete_job(job["id"])
 
+    def acknowledge_occurrence(self, occurrence_id: str) -> None:
+        self._client.acknowledge_occurrence(occurrence_id)
+
+    def fail_occurrence(self, occurrence_id: str, reason: str) -> None:
+        self._client.fail_occurrence(occurrence_id, reason)
+
     def _job_payload(self, job: dict[str, Any]) -> dict[str, Any]:
         machine = self.config.remote.machine
         payload = {

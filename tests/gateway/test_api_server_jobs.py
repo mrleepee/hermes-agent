@@ -11,6 +11,7 @@ Covers:
 """
 
 import json
+from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
 import pytest
@@ -62,6 +63,7 @@ def _create_app(adapter: APIServerAdapter) -> web.Application:
     app.router.add_post("/api/jobs/{job_id}/pause", adapter._handle_pause_job)
     app.router.add_post("/api/jobs/{job_id}/resume", adapter._handle_resume_job)
     app.router.add_post("/api/jobs/{job_id}/run", adapter._handle_run_job)
+    app.router.add_post("/internal/cron/dispatch", adapter._handle_internal_cron_dispatch)
     return app
 
 
@@ -679,3 +681,62 @@ class TestSchedulerProviderValidation:
                 assert resp.status == 500
                 data = await resp.json()
                 assert "Unsupported cron scheduler provider 'banana'" in data["error"]
+
+
+class TestInternalSchedulerDispatch:
+    @pytest.mark.asyncio
+    async def test_requires_dispatch_token(self, adapter):
+        app = _create_app(adapter)
+        async with TestClient(TestServer(app)) as cli:
+            with patch(f"{_MOD}._CRON_AVAILABLE", True), patch(
+                f"{_MOD}._cron_backend_config",
+                return_value=SimpleNamespace(remote=SimpleNamespace(dispatch_token="dispatch-secret")),
+            ):
+                resp = await cli.post("/internal/cron/dispatch", json={})
+                assert resp.status == 401
+
+    @pytest.mark.asyncio
+    async def test_accepts_authenticated_dispatch(self, adapter):
+        app = _create_app(adapter)
+        payload = {
+            "job": {"job_id": VALID_JOB_ID},
+            "occurrence": {
+                "occurrence_id": "occ_20260423_aabbccddeeff",
+                "scheduled_for": "2026-04-23T09:00:00+00:00",
+            },
+        }
+        dispatch_result = {
+            "ok": True,
+            "job_id": VALID_JOB_ID,
+            "occurrence_id": "occ_20260423_aabbccddeeff",
+            "state": "accepted",
+            "http_status": 202,
+        }
+        async with TestClient(TestServer(app)) as cli:
+            with patch(f"{_MOD}._CRON_AVAILABLE", True), patch(
+                f"{_MOD}._cron_backend_config",
+                return_value=SimpleNamespace(remote=SimpleNamespace(dispatch_token="dispatch-secret")),
+            ), patch(
+                f"{_MOD}._cron_process_remote_dispatch",
+                return_value=dict(dispatch_result),
+            ) as dispatch_mock:
+                resp = await cli.post(
+                    "/internal/cron/dispatch",
+                    json=payload,
+                    headers={"Authorization": "Bearer dispatch-secret"},
+                )
+                assert resp.status == 202
+                data = await resp.json()
+                assert data["state"] == "accepted"
+                dispatch_mock.assert_called_once_with(payload, run_async=True)
+
+    @pytest.mark.asyncio
+    async def test_returns_503_when_dispatch_token_missing(self, adapter):
+        app = _create_app(adapter)
+        async with TestClient(TestServer(app)) as cli:
+            with patch(f"{_MOD}._CRON_AVAILABLE", True), patch(
+                f"{_MOD}._cron_backend_config",
+                return_value=SimpleNamespace(remote=SimpleNamespace(dispatch_token="")),
+            ):
+                resp = await cli.post("/internal/cron/dispatch", json={})
+                assert resp.status == 503

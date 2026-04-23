@@ -16,6 +16,7 @@ import logging
 import os
 import subprocess
 import sys
+import threading
 
 # fcntl is Unix-only; on Windows use msvcrt for file locking
 try:
@@ -37,7 +38,13 @@ sys.path.insert(0, str(Path(__file__).parent.parent))
 from hermes_constants import get_hermes_home
 from hermes_cli.config import load_config
 from hermes_time import now as _hermes_now
-from cron.provider import ensure_scheduler_backend_runtime, SchedulerProviderError
+from cron.dispatch_receipts import create_receipt_if_absent, get_receipt, update_receipt
+from cron.provider import (
+    REMOTE_SCHEDULER_PROVIDER,
+    SchedulerProviderError,
+    build_scheduler_backend_for_provider,
+    ensure_scheduler_backend_runtime,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -77,7 +84,7 @@ _LEGACY_HOME_TARGET_ENV_VARS = {
     "QQBOT_HOME_CHANNEL": "QQ_HOME_CHANNEL",
 }
 
-from cron.jobs import get_due_jobs, mark_job_run, save_job_output, advance_next_run
+from cron.jobs import advance_next_run, get_due_jobs, get_job, mark_job_run, save_job_output
 
 # Sentinel: when a cron agent has nothing new to report, it can start its
 # response with this marker to suppress delivery.  Output is still saved
@@ -1035,6 +1042,211 @@ def run_job(job: dict) -> tuple[bool, str, str, Optional[str]]:
                 logger.debug("Job '%s': failed to close SQLite session store: %s", job_id, e)
 
 
+def _deliver_job_result(
+    job: dict,
+    *,
+    success: bool,
+    final_response: str,
+    error: Optional[str],
+    adapters=None,
+    loop=None,
+) -> tuple[bool, Optional[str], Optional[str]]:
+    deliver_content = final_response if success else f"⚠️ Cron job '{job.get('name', job['id'])}' failed:\n{error}"
+    should_deliver = bool(deliver_content)
+    if should_deliver and success and SILENT_MARKER in deliver_content.strip().upper():
+        logger.info("Job '%s': agent returned %s — skipping delivery", job["id"], SILENT_MARKER)
+        should_deliver = False
+
+    delivery_error = None
+    if should_deliver:
+        try:
+            delivery_error = _deliver_result(job, deliver_content, adapters=adapters, loop=loop)
+        except Exception as de:
+            delivery_error = str(de)
+            logger.error("Delivery failed for job %s: %s", job["id"], de)
+
+    if success and not final_response:
+        success = False
+        error = "Agent completed but produced empty response (model error, timeout, or misconfiguration)"
+
+    return success, error, delivery_error
+
+
+def _sync_remote_occurrence_completion(job: dict, occurrence_id: str, *, success: bool, error: Optional[str]) -> None:
+    backend = build_scheduler_backend_for_provider(job.get("scheduler_provider") or "builtin")
+    if backend.provider_name != REMOTE_SCHEDULER_PROVIDER:
+        return
+    if success:
+        backend.acknowledge_occurrence(occurrence_id)
+    else:
+        backend.fail_occurrence(occurrence_id, error or "Hermes job failed")
+
+
+def _execute_remote_occurrence(job: dict, occurrence: dict, *, adapters=None, loop=None) -> None:
+    occurrence_id = occurrence["occurrence_id"]
+    failure_reason: Optional[str] = None
+    local_success = False
+    try:
+        success, output, final_response, error = run_job(job)
+        save_job_output(job["id"], output)
+        success, error, delivery_error = _deliver_job_result(
+            job,
+            success=success,
+            final_response=final_response,
+            error=error,
+            adapters=adapters,
+            loop=loop,
+        )
+        failure_reason = error or delivery_error
+        local_success = bool(success)
+        mark_job_run(job["id"], success, error, delivery_error=delivery_error)
+    except Exception as exc:
+        failure_reason = str(exc)
+        logger.error("Error processing remote occurrence %s for job %s: %s", occurrence_id, job["id"], exc)
+        mark_job_run(job["id"], False, str(exc))
+    finally:
+        finished_at = _hermes_now().isoformat()
+        if local_success:
+            try:
+                _sync_remote_occurrence_completion(job, occurrence_id, success=True, error=None)
+            except Exception as exc:
+                logger.error("Failed to acknowledge scheduler occurrence %s: %s", occurrence_id, exc)
+            update_receipt(
+                occurrence_id,
+                {
+                    "state": "completed",
+                    "finished_at": finished_at,
+                    "error": None,
+                },
+            )
+        else:
+            reason = failure_reason or "Hermes job failed"
+            try:
+                _sync_remote_occurrence_completion(job, occurrence_id, success=False, error=reason)
+            except Exception as exc:
+                logger.error("Failed to report scheduler occurrence failure %s: %s", occurrence_id, exc)
+            update_receipt(
+                occurrence_id,
+                {
+                    "state": "failed",
+                    "finished_at": finished_at,
+                    "error": reason,
+                },
+            )
+
+
+def process_remote_dispatch(
+    payload: dict,
+    *,
+    adapters=None,
+    loop=None,
+    run_async: bool = False,
+) -> dict:
+    if not isinstance(payload, dict):
+        return {"ok": False, "state": "invalid_payload", "error": "Payload must be a JSON object.", "http_status": 400}
+
+    job_info = payload.get("job")
+    occurrence_info = payload.get("occurrence")
+    if not isinstance(job_info, dict) or not isinstance(occurrence_info, dict):
+        return {
+            "ok": False,
+            "state": "invalid_payload",
+            "error": "Payload must include 'job' and 'occurrence' objects.",
+            "http_status": 400,
+        }
+
+    job_id = str(job_info.get("job_id") or "").strip()
+    occurrence_id = str(occurrence_info.get("occurrence_id") or "").strip()
+    scheduled_for = str(occurrence_info.get("scheduled_for") or "").strip()
+    if not job_id or not occurrence_id or not scheduled_for:
+        return {
+            "ok": False,
+            "state": "invalid_payload",
+            "error": "Payload must include job.job_id, occurrence.occurrence_id, and occurrence.scheduled_for.",
+            "http_status": 400,
+        }
+
+    existing_receipt = get_receipt(occurrence_id)
+    if existing_receipt is not None:
+        state = str(existing_receipt.get("state") or "").strip().lower()
+        duplicate_state = {
+            "running": "duplicate_running",
+            "completed": "duplicate_completed",
+            "failed": "duplicate_failed",
+            "received": "duplicate_running",
+        }.get(state, "duplicate_running")
+        return {
+            "ok": True,
+            "job_id": job_id,
+            "occurrence_id": occurrence_id,
+            "state": duplicate_state,
+            "http_status": 200,
+        }
+
+    job = get_job(job_id)
+    if not job:
+        return {"ok": False, "job_id": job_id, "occurrence_id": occurrence_id, "state": "rejected_unknown_job", "http_status": 404}
+    if str(job.get("scheduler_provider") or "").strip().lower() != REMOTE_SCHEDULER_PROVIDER:
+        return {
+            "ok": False,
+            "job_id": job_id,
+            "occurrence_id": occurrence_id,
+            "state": "rejected_provider_mismatch",
+            "http_status": 409,
+        }
+    if not job.get("enabled", True) or job.get("state") == "paused":
+        return {"ok": False, "job_id": job_id, "occurrence_id": occurrence_id, "state": "rejected_paused", "http_status": 409}
+
+    now = _hermes_now().isoformat()
+    _, created = create_receipt_if_absent(
+        {
+            "occurrence_id": occurrence_id,
+            "job_id": job_id,
+            "scheduled_for": scheduled_for,
+            "state": "received",
+            "received_at": now,
+            "started_at": None,
+            "finished_at": None,
+            "error": None,
+        }
+    )
+    if not created:
+        return {
+            "ok": True,
+            "job_id": job_id,
+            "occurrence_id": occurrence_id,
+            "state": "duplicate_running",
+            "http_status": 200,
+        }
+
+    receipt = update_receipt(
+        occurrence_id,
+        {
+            "state": "running",
+            "started_at": _hermes_now().isoformat(),
+        },
+    )
+
+    if run_async:
+        worker = threading.Thread(
+            target=_execute_remote_occurrence,
+            args=(job, receipt),
+            kwargs={"adapters": adapters, "loop": loop},
+            daemon=True,
+        )
+        worker.start()
+    else:
+        _execute_remote_occurrence(job, receipt, adapters=adapters, loop=loop)
+
+    return {
+        "ok": True,
+        "job_id": job_id,
+        "occurrence_id": occurrence_id,
+        "state": "accepted",
+        "http_status": 202,
+    }
+
+
 def tick(verbose: bool = True, adapters=None, loop=None) -> int:
     """
     Check and run all due jobs.
@@ -1123,29 +1335,14 @@ def tick(verbose: bool = True, adapters=None, loop=None) -> int:
                 if verbose:
                     logger.info("Output saved to: %s", output_file)
 
-                # Deliver the final response to the origin/target chat.
-                # If the agent responded with [SILENT], skip delivery (but
-                # output is already saved above).  Failed jobs always deliver.
-                deliver_content = final_response if success else f"⚠️ Cron job '{job.get('name', job['id'])}' failed:\n{error}"
-                should_deliver = bool(deliver_content)
-                if should_deliver and success and SILENT_MARKER in deliver_content.strip().upper():
-                    logger.info("Job '%s': agent returned %s — skipping delivery", job["id"], SILENT_MARKER)
-                    should_deliver = False
-
-                delivery_error = None
-                if should_deliver:
-                    try:
-                        delivery_error = _deliver_result(job, deliver_content, adapters=adapters, loop=loop)
-                    except Exception as de:
-                        delivery_error = str(de)
-                        logger.error("Delivery failed for job %s: %s", job["id"], de)
-
-                # Treat empty final_response as a soft failure so last_status
-                # is not "ok" — the agent ran but produced nothing useful.
-                # (issue #8585)
-                if success and not final_response:
-                    success = False
-                    error = "Agent completed but produced empty response (model error, timeout, or misconfiguration)"
+                success, error, delivery_error = _deliver_job_result(
+                    job,
+                    success=success,
+                    final_response=final_response,
+                    error=error,
+                    adapters=adapters,
+                    loop=loop,
+                )
 
                 mark_job_run(job["id"], success, error, delivery_error=delivery_error)
                 return True
