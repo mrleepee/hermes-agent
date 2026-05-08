@@ -387,6 +387,23 @@ def save_jobs(jobs: List[Dict[str, Any]]):
         raise
 
 
+def _platform_locked_model() -> Optional[str]:
+    """Return deployment-level model lock for cron jobs, if configured."""
+    return (
+        os.getenv("HERMES_PLATFORM_LOCKED_MODEL")
+        or os.getenv("HERMES_WEBUI_LOCKED_MODEL")
+        or ""
+    ).strip() or None
+
+
+def _platform_locked_provider() -> Optional[str]:
+    return (os.getenv("HERMES_PLATFORM_LOCKED_PROVIDER") or "").strip() or None
+
+
+def _platform_locked_base_url() -> Optional[str]:
+    return (os.getenv("HERMES_PLATFORM_LOCKED_BASE_URL") or "").strip().rstrip("/") or None
+
+
 def _normalize_workdir(workdir: Optional[str]) -> Optional[str]:
     """Normalize and validate a cron job workdir.
 
@@ -509,6 +526,9 @@ def create_job(
     normalized_model = normalized_model or None
     normalized_provider = normalized_provider or None
     normalized_base_url = normalized_base_url or None
+    normalized_model = _platform_locked_model() or normalized_model
+    normalized_provider = _platform_locked_provider() or normalized_provider
+    normalized_base_url = _platform_locked_base_url() or normalized_base_url
     normalized_script = str(script).strip() if isinstance(script, str) else None
     normalized_script = normalized_script or None
     normalized_toolsets = [str(t).strip() for t in enabled_toolsets if str(t).strip()] if enabled_toolsets else None
